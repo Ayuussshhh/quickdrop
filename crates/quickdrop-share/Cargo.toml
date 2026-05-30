@@ -1,0 +1,45 @@
+[package]
+name = "quickdrop-share"
+version = "0.1.0"
+edition = "2021"
+description = "QuickDrop Share: ephemeral browser-based file sharing over LAN (no app, no account)."
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "quickdrop_share"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["io"] }
+futures = { workspace = true }
+
+axum = { workspace = true }
+tower = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+uuid = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+blake3 = { workspace = true }
+time = { workspace = true }
+
+if-addrs = { workspace = true }
+qrcode = { workspace = true }
+mime_guess = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json"] }
+
+# Standalone CLI to exercise the whole feature without Tauri/React:
+#   cargo run -p quickdrop-share --example serve -- <file>
+[[example]]
+name = "serve"
+path = "examples/serve.rs"

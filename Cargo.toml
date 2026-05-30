@@ -1,0 +1,75 @@
+[workspace]
+resolver = "2"
+members = [
+    "src-tauri",
+    "crates/quickdrop-core",
+    "crates/quickdrop-share",
+]
+
+# Shared dependency versions across the workspace.
+# Crates inherit them with `<dep> = { workspace = true, ... }`.
+[workspace.dependencies]
+# Async runtime + utilities
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+
+# Errors / logging
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "time"] }
+tracing-appender = "0.2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rmp-serde = "1"            # MessagePack for the wire protocol
+
+# IDs / time / hashing
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
+hex = "0.4"
+time = { version = "0.3", features = ["serde", "formatting", "macros"] }
+
+# Storage / config
+sled = "0.34"
+directories = "5"
+
+# Networking (used by core later)
+mdns-sd = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"] }
+rustls-pemfile = "2"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = "0.13"
+if-addrs = "0.13"
+socket2 = { version = "0.5", features = ["all"] }
+
+# Crypto / identity (used by core later)
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+blake3 = "1"
+keyring = "3"
+
+# QuickDrop Share: embedded HTTP server + QR for browser-based receiving.
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "query", "json", "tower-log"] }
+tower = "0.5"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+mime_guess = "2"
+
+# Tauri (resolved here so all crates use the same minor)
+tauri = { version = "2", features = [] }
+tauri-build = { version = "2", features = [] }
+
+# Profile tuning: faster dev builds, slim release binary.
+[profile.dev]
+opt-level = 0
+debug = 1
+incremental = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
