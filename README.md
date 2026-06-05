@@ -74,7 +74,3 @@ Produces an MSI under `src-tauri/target/release/bundle/msi/`.
 10. Windows context menu integration (`--send` CLI, registry installer)
 11. Packaging + auto-start + uninstall cleanup
 12. Test matrix (large files, network drops, multi-device)
-
-## License
-
-MIT OR Apache-2.0
