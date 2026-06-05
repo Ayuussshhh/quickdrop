@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 
@@ -29,7 +30,75 @@ type TrustedPeer = {
   fingerprint: string;
   paired_at_ms: number;
   last_seen_ms: number;
+  role: DeviceRole;
+  auto_accept: boolean;
+  auto_save: boolean;
+  dest_override: string | null;
 };
+
+type DeviceRole = "mobile" | "desktop" | "laptop" | "nas" | "workstation" | "other";
+
+const DEVICE_ROLES: DeviceRole[] = [
+  "mobile",
+  "desktop",
+  "laptop",
+  "nas",
+  "workstation",
+  "other",
+];
+
+type HistoryRecord = {
+  id: string;
+  file_name: string;
+  direction: "send" | "receive";
+  peer_id: string;
+  source_device: string;
+  target_device: string;
+  timestamp_ms: number;
+  size: number;
+  status: string;
+  paths: string[];
+};
+
+type SpaceType = "personal" | "project" | "family" | "team";
+const SPACE_TYPES: SpaceType[] = ["personal", "project", "family", "team"];
+type MemberRole = "owner" | "editor" | "viewer";
+
+type SpaceMember = {
+  peer_id: string;
+  name: string;
+  role: MemberRole;
+  joined_at_ms: number;
+};
+
+type SharedFolder = {
+  id: string;
+  name: string;
+  path: string;
+  added_by: string;
+  added_at_ms: number;
+};
+
+type Space = {
+  id: string;
+  name: string;
+  space_type: SpaceType;
+  created_at_ms: number;
+  revision: number;
+  updated_at_ms: number;
+  members: SpaceMember[];
+  shared_folders: SharedFolder[];
+};
+
+type SpaceActivity = {
+  id: string;
+  space_id: string;
+  kind: string;
+  actor: string | null;
+  detail: string;
+  timestamp_ms: number;
+};
+
 
 type TransferProgress = {
   transfer_id: string;
@@ -55,10 +124,15 @@ type Prompt = {
   sas?: string;
   items?: number;
   total_bytes?: number;
+  name?: string;
+  remembered_dest?: string;
+  downloads?: string;
+  desktop?: string;
+  documents?: string;
   trusted: boolean;
 };
 
-type Tab = "devices" | "transfers" | "trusted" | "share";
+type Tab = "devices" | "transfers" | "trusted" | "history" | "spaces" | "share";
 
 type ShareSession = {
   session_id: string;
@@ -116,6 +190,13 @@ function App() {
   const [shares, setShares] = useState<ShareSession[]>([]);
   const [sharing, setSharing] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [history, setHistory] = useState<HistoryRecord[]>([]);
+  const [spaces, setSpaces] = useState<Space[]>([]);
+  // Device id currently under a drag-over, for the drop highlight.
+  const [dropPeerId, setDropPeerId] = useState<string | null>(null);
+  // Live peer list for use inside the drag-drop event closure.
+  const peersRef = useRef<Peer[]>([]);
+  peersRef.current = peers;
 
   async function refreshTrusted() {
     try {
@@ -125,11 +206,29 @@ function App() {
     }
   }
 
+  async function refreshHistory() {
+    try {
+      setHistory(await invoke<HistoryRecord[]>("list_history"));
+    } catch (e) {
+      console.error("list_history failed", e);
+    }
+  }
+
+  async function refreshSpaces() {
+    try {
+      setSpaces(await invoke<Space[]>("list_spaces"));
+    } catch (e) {
+      console.error("list_spaces failed", e);
+    }
+  }
+
   useEffect(() => {
     invoke<AppInfo>("app_info").then(setInfo).catch(console.error);
     invoke<Peer[]>("list_peers").then(setPeers).catch(console.error);
     invoke<TransferProgress[]>("list_transfers").then(setTransfers).catch(console.error);
     refreshTrusted();
+    refreshHistory();
+    refreshSpaces();
 
     const unlisteners: Array<Promise<() => void>> = [];
 
@@ -154,6 +253,11 @@ function App() {
         setToast(`Received ${e.payload.length} file(s)`);
         setTimeout(() => setToast(null), 4000);
         refreshTrusted();
+      })
+    );
+    unlisteners.push(
+      listen("history://updated", () => {
+        refreshHistory();
       })
     );
     unlisteners.push(
@@ -195,6 +299,131 @@ function App() {
     }
   }
 
+  async function handleSetRole(id: string, role: DeviceRole) {
+    try {
+      await invoke<boolean>("set_device_role", { peerId: id, role });
+      await refreshTrusted();
+    } catch (e) {
+      console.error("set_device_role failed", e);
+    }
+  }
+
+  async function handleSetPrefs(id: string, autoAccept: boolean, autoSave: boolean) {
+    try {
+      await invoke<boolean>("set_device_prefs", {
+        peerId: id,
+        autoAccept,
+        autoSave,
+      });
+      await refreshTrusted();
+    } catch (e) {
+      console.error("set_device_prefs failed", e);
+    }
+  }
+
+  async function openHistoryFile(path: string) {
+    try {
+      await invoke("open_path", { path });
+    } catch (e) {
+      setToast(`Could not open file: ${e}`);
+      setTimeout(() => setToast(null), 4000);
+    }
+  }
+
+  async function revealHistoryFile(path: string) {
+    try {
+      await invoke("reveal_path", { path });
+    } catch (e) {
+      setToast(`Could not open folder: ${e}`);
+      setTimeout(() => setToast(null), 4000);
+    }
+  }
+
+  async function resendHistory(rec: HistoryRecord) {
+    if (rec.paths.length === 0) return;
+    const peer = peers.find((p) => p.id === rec.peer_id);
+    if (!peer) {
+      setToast(`${rec.target_device} is not online`);
+      setTimeout(() => setToast(null), 4000);
+      return;
+    }
+    setSendPaths(rec.paths);
+    setSendTarget(peer);
+    setTab("devices");
+  }
+
+  async function deleteHistory(id: string) {
+    try {
+      await invoke<boolean>("delete_history_entry", { entryId: id });
+      await refreshHistory();
+    } catch (e) {
+      console.error("delete_history_entry failed", e);
+    }
+  }
+
+  async function clearHistory() {
+    try {
+      await invoke("clear_history");
+      await refreshHistory();
+    } catch (e) {
+      console.error("clear_history failed", e);
+    }
+  }
+
+  async function createSpace(name: string, spaceType: SpaceType) {
+    try {
+      await invoke<Space>("create_space", { name, spaceType });
+      await refreshSpaces();
+    } catch (e) {
+      setToast(`Create space failed: ${e}`);
+      setTimeout(() => setToast(null), 4000);
+    }
+  }
+
+  async function deleteSpace(id: string) {
+    try {
+      await invoke<boolean>("delete_space", { spaceId: id });
+      await refreshSpaces();
+    } catch (e) {
+      console.error("delete_space failed", e);
+    }
+  }
+
+  async function addSpaceMember(spaceId: string, peer: TrustedPeer) {
+    try {
+      await invoke<Space>("add_space_member", {
+        spaceId,
+        peerId: peer.id,
+        name: peer.name,
+        role: "editor",
+      });
+      await refreshSpaces();
+    } catch (e) {
+      console.error("add_space_member failed", e);
+    }
+  }
+
+  async function removeSpaceMember(spaceId: string, peerId: string) {
+    try {
+      await invoke<Space>("remove_space_member", { spaceId, peerId });
+      await refreshSpaces();
+    } catch (e) {
+      console.error("remove_space_member failed", e);
+    }
+  }
+
+  async function addSpaceFolder(spaceId: string) {
+    const picked = await openDialog({ directory: true, multiple: false });
+    if (!picked || Array.isArray(picked)) return;
+    const name = picked.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || picked;
+    try {
+      await invoke<Space>("add_space_folder", { spaceId, name, path: picked });
+      await refreshSpaces();
+    } catch (e) {
+      console.error("add_space_folder failed", e);
+    }
+  }
+
   async function handlePair(peer: Peer) {
     try {
       await invoke("pair_with", { peerId: peer.id });
@@ -232,9 +461,14 @@ function App() {
     }
   }
 
-  async function answerPrompt(prompt_id: string, accept: boolean) {
+  async function answerPrompt(
+    prompt_id: string,
+    accept: boolean,
+    dest?: string,
+    remember?: boolean
+  ) {
     try {
-      await invoke("answer_prompt", { promptId: prompt_id, accept });
+      await invoke("answer_prompt", { promptId: prompt_id, accept, dest, remember });
     } catch (e) {
       console.error("answer_prompt failed", e);
     }
@@ -302,6 +536,36 @@ function App() {
     return () => clearInterval(h);
   }, [tab, shareTicket]);
 
+  // Native drag-and-drop: dropping files/folders onto a device card
+  // reuses the normal send flow (opens the confirm modal pre-filled).
+  useEffect(() => {
+    const peerIdAt = (x: number, y: number): string | null => {
+      const dpr = window.devicePixelRatio || 1;
+      const el = document.elementFromPoint(x / dpr, y / dpr);
+      const card = el?.closest("[data-peer-id]") as HTMLElement | null;
+      return card?.getAttribute("data-peer-id") ?? null;
+    };
+    const un = getCurrentWebview().onDragDropEvent((event) => {
+      const p = event.payload;
+      if (p.type === "over") {
+        setDropPeerId(peerIdAt(p.position.x, p.position.y));
+      } else if (p.type === "drop") {
+        const id = peerIdAt(p.position.x, p.position.y);
+        setDropPeerId(null);
+        if (!id || p.paths.length === 0) return;
+        const peer = peersRef.current.find((pe) => pe.id === id);
+        if (!peer) return;
+        setSendPaths(p.paths);
+        setSendTarget(peer);
+      } else {
+        setDropPeerId(null);
+      }
+    });
+    return () => {
+      un.then((u) => u());
+    };
+  }, []);
+
   return (
     <div className="app">
       <header className="topbar">
@@ -333,6 +597,12 @@ function App() {
         <TabButton active={tab === "trusted"} onClick={() => setTab("trusted")}>
           Trusted ({trusted.length})
         </TabButton>
+        <TabButton active={tab === "history"} onClick={() => setTab("history")}>
+          History ({history.length})
+        </TabButton>
+        <TabButton active={tab === "spaces"} onClick={() => setTab("spaces")}>
+          Spaces ({spaces.length})
+        </TabButton>
         <TabButton active={tab === "share"} onClick={() => setTab("share")}>
           Share ({shares.length})
         </TabButton>
@@ -343,6 +613,7 @@ function App() {
           <DevicesPane
             peers={peers}
             sendPaths={sendPaths}
+            dropPeerId={dropPeerId}
             onPickFiles={pickFiles}
             onClearPaths={() => setSendPaths([])}
             onSend={handleStartSend}
@@ -352,7 +623,36 @@ function App() {
         {tab === "transfers" && (
           <TransfersPane transfers={transfers} onCancel={cancelTransfer} />
         )}
-        {tab === "trusted" && <TrustedPane peers={trusted} onForget={handleForget} />}
+        {tab === "trusted" && (
+          <TrustedPane
+            peers={trusted}
+            onForget={handleForget}
+            onSetRole={handleSetRole}
+            onSetPrefs={handleSetPrefs}
+          />
+        )}
+        {tab === "history" && (
+          <HistoryPane
+            records={history}
+            peers={peers}
+            onOpenFile={openHistoryFile}
+            onOpenFolder={revealHistoryFile}
+            onResend={resendHistory}
+            onDelete={deleteHistory}
+            onClear={clearHistory}
+          />
+        )}
+        {tab === "spaces" && (
+          <SpacesPane
+            spaces={spaces}
+            trusted={trusted}
+            onCreate={createSpace}
+            onDelete={deleteSpace}
+            onAddMember={addSpaceMember}
+            onRemoveMember={removeSpaceMember}
+            onAddFolder={addSpaceFolder}
+          />
+        )}
         {tab === "share" && (
           <SharePane
             shares={shares}
@@ -440,6 +740,7 @@ function TabButton({
 function DevicesPane({
   peers,
   sendPaths,
+  dropPeerId,
   onPickFiles,
   onClearPaths,
   onSend,
@@ -447,6 +748,7 @@ function DevicesPane({
 }: {
   peers: Peer[];
   sendPaths: string[];
+  dropPeerId: string | null;
   onPickFiles: () => void;
   onClearPaths: () => void;
   onSend: (p: Peer) => void;
@@ -471,12 +773,16 @@ function DevicesPane({
       {peers.length === 0 ? (
         <EmptyState
           title="No devices found yet"
-          body="Devices on the same Wi-Fi network will appear here automatically."
+          body="Devices on the same Wi-Fi network will appear here automatically. Tip: drag files or folders onto a device to send."
         />
       ) : (
         <ul className="device-list">
           {peers.map((p) => (
-            <li key={p.id} className="device">
+            <li
+              key={p.id}
+              className={`device${dropPeerId === p.id ? " device-drop" : ""}`}
+              data-peer-id={p.id}
+            >
               <div className="device-main">
                 <div className="device-name">{p.name}</div>
                 <div className="device-meta">
@@ -489,7 +795,7 @@ function DevicesPane({
                   className="btn btn-primary"
                   onClick={() => onSend(p)}
                   disabled={sendPaths.length === 0}
-                  title={sendPaths.length === 0 ? "Choose files first" : ""}
+                  title={sendPaths.length === 0 ? "Choose files first, or drag them here" : ""}
                 >
                   Send
                 </button>
@@ -557,9 +863,13 @@ function TransfersPane({
 function TrustedPane({
   peers,
   onForget,
+  onSetRole,
+  onSetPrefs,
 }: {
   peers: TrustedPeer[];
   onForget: (id: string) => void;
+  onSetRole: (id: string, role: DeviceRole) => void;
+  onSetPrefs: (id: string, autoAccept: boolean, autoSave: boolean) => void;
 }) {
   if (peers.length === 0) {
     return (
@@ -574,13 +884,61 @@ function TrustedPane({
       {peers.map((p) => (
         <li key={p.id} className="trusted">
           <div className="trusted-main">
-            <div className="trusted-name">{p.name}</div>
+            <div className="trusted-name">
+              {p.name}
+              <span className="role-badge">{p.role}</span>
+            </div>
             <div className="trusted-fp">{p.fingerprint}</div>
             <div className="trusted-meta">
               Paired {new Date(p.paired_at_ms).toLocaleString()}
               {p.last_seen_ms > p.paired_at_ms && (
                 <> · last seen {new Date(p.last_seen_ms).toLocaleString()}</>
               )}
+            </div>
+
+            <div className="device-settings">
+              <label className="ds-row">
+                <span className="ds-label">Role</span>
+                <select
+                  className="ds-select"
+                  value={p.role}
+                  onChange={(e) => onSetRole(p.id, e.target.value as DeviceRole)}
+                >
+                  {DEVICE_ROLES.map((r) => (
+                    <option key={r} value={r}>
+                      {r.charAt(0).toUpperCase() + r.slice(1)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="ds-row ds-check" title="Skip the approval prompt and start receiving immediately">
+                <input
+                  type="checkbox"
+                  checked={p.auto_accept}
+                  onChange={(e) => onSetPrefs(p.id, e.target.checked, p.auto_save)}
+                />
+                <span>Instant Transfer (auto-accept)</span>
+              </label>
+
+              <label
+                className="ds-row ds-check"
+                title={
+                  p.dest_override
+                    ? `Save automatically to ${p.dest_override}`
+                    : "Set a remembered folder for this device first (accept a transfer and choose “Remember”)"
+                }
+              >
+                <input
+                  type="checkbox"
+                  checked={p.auto_save}
+                  disabled={!p.auto_accept}
+                  onChange={(e) => onSetPrefs(p.id, p.auto_accept, e.target.checked)}
+                />
+                <span>
+                  Auto-save{p.dest_override ? ` → ${p.dest_override}` : " (uses default folder)"}
+                </span>
+              </label>
             </div>
           </div>
           <button className="btn-danger" onClick={() => onForget(p.id)}>
@@ -589,6 +947,312 @@ function TrustedPane({
         </li>
       ))}
     </ul>
+  );
+}
+
+function dayBucket(ts: number): "Today" | "Yesterday" | "Older" {
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const startOfYesterday = startOfToday - 24 * 60 * 60 * 1000;
+  if (ts >= startOfToday) return "Today";
+  if (ts >= startOfYesterday) return "Yesterday";
+  return "Older";
+}
+
+function HistoryPane({
+  records,
+  peers,
+  onOpenFile,
+  onOpenFolder,
+  onResend,
+  onDelete,
+  onClear,
+}: {
+  records: HistoryRecord[];
+  peers: Peer[];
+  onOpenFile: (path: string) => void;
+  onOpenFolder: (path: string) => void;
+  onResend: (rec: HistoryRecord) => void;
+  onDelete: (id: string) => void;
+  onClear: () => void;
+}) {
+  const groups = useMemo(() => {
+    const order: Array<"Today" | "Yesterday" | "Older"> = ["Today", "Yesterday", "Older"];
+    const map: Record<string, HistoryRecord[]> = { Today: [], Yesterday: [], Older: [] };
+    for (const r of records) map[dayBucket(r.timestamp_ms)].push(r);
+    return order
+      .map((label) => ({ label, items: map[label] }))
+      .filter((g) => g.items.length > 0);
+  }, [records]);
+
+  if (records.length === 0) {
+    return (
+      <EmptyState
+        title="No transfer history"
+        body="Completed sends and receives are recorded here automatically."
+      />
+    );
+  }
+
+  return (
+    <div>
+      <div className="send-bar">
+        <span>{records.length} record(s)</span>
+        <button className="btn-link" onClick={onClear}>
+          Clear all
+        </button>
+      </div>
+      {groups.map((g) => (
+        <div key={g.label} className="history-group">
+          <h3 className="history-day">{g.label}</h3>
+          <ul className="history-list">
+            {g.items.map((r) => {
+              const path = r.paths[0];
+              const online = peers.some((p) => p.id === r.peer_id);
+              return (
+                <li key={r.id} className={`history-row history-${r.status.toLowerCase()}`}>
+                  <span className="xfer-dir">{r.direction === "send" ? "↑" : "↓"}</span>
+                  <div className="history-main">
+                    <div className="history-name" title={path}>
+                      {r.file_name}
+                    </div>
+                    <div className="history-meta">
+                      {r.direction === "send"
+                        ? `to ${r.target_device}`
+                        : `from ${r.source_device}`}{" "}
+                      · {fmtBytes(r.size)} · {r.status} ·{" "}
+                      {new Date(r.timestamp_ms).toLocaleTimeString()}
+                    </div>
+                  </div>
+                  <div className="history-actions">
+                    {path && (
+                      <button className="btn-link" onClick={() => onOpenFile(path)}>
+                        Open
+                      </button>
+                    )}
+                    {path && (
+                      <button className="btn-link" onClick={() => onOpenFolder(path)}>
+                        Folder
+                      </button>
+                    )}
+                    {r.direction === "send" && r.paths.length > 0 && (
+                      <button
+                        className="btn-link"
+                        disabled={!online}
+                        title={online ? "" : `${r.target_device} is offline`}
+                        onClick={() => onResend(r)}
+                      >
+                        Resend
+                      </button>
+                    )}
+                    <button className="btn-link btn-link-danger" onClick={() => onDelete(r.id)}>
+                      Delete
+                    </button>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function SpacesPane({
+  spaces,
+  trusted,
+  onCreate,
+  onDelete,
+  onAddMember,
+  onRemoveMember,
+  onAddFolder,
+}: {
+  spaces: Space[];
+  trusted: TrustedPeer[];
+  onCreate: (name: string, type: SpaceType) => void;
+  onDelete: (id: string) => void;
+  onAddMember: (spaceId: string, peer: TrustedPeer) => void;
+  onRemoveMember: (spaceId: string, peerId: string) => void;
+  onAddFolder: (spaceId: string) => void;
+}) {
+  const [name, setName] = useState("");
+  const [type, setType] = useState<SpaceType>("personal");
+
+  return (
+    <div>
+      <div className="space-create">
+        <input
+          className="ds-input"
+          placeholder="New space name…"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+        />
+        <select
+          className="ds-select"
+          value={type}
+          onChange={(e) => setType(e.target.value as SpaceType)}
+        >
+          {SPACE_TYPES.map((t) => (
+            <option key={t} value={t}>
+              {t.charAt(0).toUpperCase() + t.slice(1)}
+            </option>
+          ))}
+        </select>
+        <button
+          className="btn btn-primary"
+          disabled={!name.trim()}
+          onClick={() => {
+            onCreate(name.trim(), type);
+            setName("");
+          }}
+        >
+          Create
+        </button>
+      </div>
+
+      {spaces.length === 0 ? (
+        <EmptyState
+          title="No spaces yet"
+          body="Create a space to group devices and shared folders. Collaboration and sync come later — this sets up the foundation."
+        />
+      ) : (
+        <ul className="space-list">
+          {spaces.map((s) => (
+            <SpaceCard
+              key={s.id}
+              space={s}
+              trusted={trusted}
+              onDelete={onDelete}
+              onAddMember={onAddMember}
+              onRemoveMember={onRemoveMember}
+              onAddFolder={onAddFolder}
+            />
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function SpaceCard({
+  space,
+  trusted,
+  onDelete,
+  onAddMember,
+  onRemoveMember,
+  onAddFolder,
+}: {
+  space: Space;
+  trusted: TrustedPeer[];
+  onDelete: (id: string) => void;
+  onAddMember: (spaceId: string, peer: TrustedPeer) => void;
+  onRemoveMember: (spaceId: string, peerId: string) => void;
+  onAddFolder: (spaceId: string) => void;
+}) {
+  const [activity, setActivity] = useState<SpaceActivity[]>([]);
+  const [showActivity, setShowActivity] = useState(false);
+  const memberIds = new Set(space.members.map((m) => m.peer_id));
+  const candidates = trusted.filter((t) => !memberIds.has(t.id));
+
+  async function loadActivity() {
+    try {
+      const a = await invoke<SpaceActivity[]>("space_activity", { spaceId: space.id });
+      setActivity(a);
+      setShowActivity((v) => !v);
+    } catch (e) {
+      console.error("space_activity failed", e);
+    }
+  }
+
+  return (
+    <li className="space-card">
+      <div className="space-head">
+        <div>
+          <span className="space-name">{space.name}</span>
+          <span className="role-badge">{space.space_type}</span>
+        </div>
+        <button className="btn-danger" onClick={() => onDelete(space.id)}>
+          Delete
+        </button>
+      </div>
+
+      <div className="space-section">
+        <div className="space-section-head">
+          <span>Members ({space.members.length})</span>
+          {candidates.length > 0 && (
+            <select
+              className="ds-select"
+              value=""
+              onChange={(e) => {
+                const peer = trusted.find((t) => t.id === e.target.value);
+                if (peer) onAddMember(space.id, peer);
+              }}
+            >
+              <option value="">Add member…</option>
+              {candidates.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+        <ul className="space-members">
+          {space.members.map((m) => (
+            <li key={m.peer_id}>
+              {m.name} <span className="role-badge">{m.role}</span>
+              {m.role !== "owner" && (
+                <button
+                  className="btn-link btn-link-danger"
+                  onClick={() => onRemoveMember(space.id, m.peer_id)}
+                >
+                  Remove
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+      </div>
+
+      <div className="space-section">
+        <div className="space-section-head">
+          <span>Shared folders ({space.shared_folders.length})</span>
+          <button className="btn-link" onClick={() => onAddFolder(space.id)}>
+            Add folder…
+          </button>
+        </div>
+        <ul className="space-folders">
+          {space.shared_folders.map((f) => (
+            <li key={f.id} title={f.path}>
+              {f.name}
+            </li>
+          ))}
+          {space.shared_folders.length === 0 && (
+            <li className="muted">No shared folders yet</li>
+          )}
+        </ul>
+      </div>
+
+      <div className="space-foot">
+        <button className="btn-link" onClick={loadActivity}>
+          {showActivity ? "Hide activity" : "Activity feed"}
+        </button>
+        <span className="muted">rev {space.revision}</span>
+      </div>
+      {showActivity && (
+        <ul className="space-activity">
+          {activity.map((a) => (
+            <li key={a.id}>
+              <span className="muted">{new Date(a.timestamp_ms).toLocaleString()}</span> ·{" "}
+              {a.kind.replace(/_/g, " ")}
+              {a.detail ? `: ${a.detail}` : ""}
+            </li>
+          ))}
+          {activity.length === 0 && <li className="muted">No activity</li>}
+        </ul>
+      )}
+    </li>
   );
 }
 
@@ -795,34 +1459,115 @@ function PromptModal({
   onAnswer,
 }: {
   prompt: Prompt;
-  onAnswer: (id: string, accept: boolean) => void;
+  onAnswer: (id: string, accept: boolean, dest?: string, remember?: boolean) => void;
 }) {
+  if (prompt.kind === "transfer") {
+    return <TransferPrompt prompt={prompt} onAnswer={onAnswer} />;
+  }
   return (
-    <Modal
-      title={prompt.kind === "pair" ? "Incoming pairing request" : "Incoming file transfer"}
-      onClose={() => onAnswer(prompt.prompt_id, false)}
-    >
+    <Modal title="Incoming pairing request" onClose={() => onAnswer(prompt.prompt_id, false)}>
       <p className="modal-sub">
         From <strong>{prompt.peer_name}</strong>{" "}
         {prompt.trusted && <span className="badge">trusted</span>}
       </p>
       <p className="modal-fp">Fingerprint: {prompt.fingerprint}</p>
-      {prompt.kind === "pair" && (
-        <>
-          <p>Verify this code matches the one shown on the other device:</p>
-          <div className="sas">{prompt.sas}</div>
-        </>
-      )}
-      {prompt.kind === "transfer" && (
-        <p>
-          {prompt.items} item(s), {fmtBytes(prompt.total_bytes ?? 0)} total
-        </p>
-      )}
+      <p>Verify this code matches the one shown on the other device:</p>
+      <div className="sas">{prompt.sas}</div>
       <div className="modal-actions">
         <button className="btn" onClick={() => onAnswer(prompt.prompt_id, false)}>
           Reject
         </button>
         <button className="btn btn-primary" onClick={() => onAnswer(prompt.prompt_id, true)}>
+          Accept
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+function TransferPrompt({
+  prompt,
+  onAnswer,
+}: {
+  prompt: Prompt;
+  onAnswer: (id: string, accept: boolean, dest?: string, remember?: boolean) => void;
+}) {
+  // Build the destination options. "Downloads" is the default/fallback.
+  const presets = useMemo(() => {
+    const out: Array<{ label: string; path: string }> = [];
+    if (prompt.downloads) out.push({ label: "Downloads", path: prompt.downloads });
+    if (prompt.desktop) out.push({ label: "Desktop", path: prompt.desktop });
+    if (prompt.documents) out.push({ label: "Documents", path: prompt.documents });
+    return out;
+  }, [prompt]);
+
+  const [dest, setDest] = useState<string>(
+    prompt.remembered_dest || prompt.downloads || ""
+  );
+  const [remember, setRemember] = useState(false);
+
+  async function chooseFolder() {
+    const picked = await openDialog({ directory: true, multiple: false });
+    if (picked && !Array.isArray(picked)) setDest(picked);
+  }
+
+  const isPreset = presets.some((p) => p.path === dest);
+
+  return (
+    <Modal title="Incoming file transfer" onClose={() => onAnswer(prompt.prompt_id, false)}>
+      <p className="modal-sub">
+        From <strong>{prompt.peer_name}</strong>{" "}
+        {prompt.trusted && <span className="badge">trusted</span>}
+      </p>
+      <p className="modal-fp">Fingerprint: {prompt.fingerprint}</p>
+      <p>
+        <strong>{prompt.name ?? `${prompt.items} item(s)`}</strong>
+        {prompt.items && prompt.items > 1 ? ` and ${prompt.items - 1} more` : ""} ·{" "}
+        {fmtBytes(prompt.total_bytes ?? 0)}
+      </p>
+
+      <p className="modal-sub">Save to:</p>
+      <div className="dest-options">
+        {presets.map((p) => (
+          <button
+            key={p.path}
+            className={`dest-chip${dest === p.path ? " dest-chip-active" : ""}`}
+            title={p.path}
+            onClick={() => setDest(p.path)}
+          >
+            {p.label}
+          </button>
+        ))}
+        <button
+          className={`dest-chip${dest && !isPreset ? " dest-chip-active" : ""}`}
+          onClick={chooseFolder}
+        >
+          Choose Folder…
+        </button>
+      </div>
+      <p className="modal-fp dest-path" title={dest}>
+        {dest || "No destination selected"}
+      </p>
+
+      <label className="dest-remember">
+        <input
+          type="checkbox"
+          checked={remember}
+          onChange={(e) => setRemember(e.target.checked)}
+        />{" "}
+        Remember this destination for {prompt.peer_name}
+      </label>
+
+      <div className="modal-actions">
+        <button className="btn" onClick={() => onAnswer(prompt.prompt_id, false)}>
+          Reject
+        </button>
+        <button
+          className="btn btn-primary"
+          disabled={!dest}
+          title={!dest ? "Choose a destination first" : ""}
+          onClick={() => onAnswer(prompt.prompt_id, true, dest, remember)}
+        >
           Accept
         </button>
       </div>
