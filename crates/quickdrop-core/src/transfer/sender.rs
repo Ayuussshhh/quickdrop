@@ -23,7 +23,6 @@ use crate::transfer::handshake::{self, PeerHandshake};
 use crate::transfer::hash;
 use crate::transfer::protocol::{
     FileEnd, FileStart, Manifest, ManifestItem, Request, Response, TransferEnd, TransferStatus,
-    DEFAULT_CHUNK_SIZE,
 };
 use crate::transport::{self, MAX_CONTROL_FRAME};
 use crate::{Error, Result};
@@ -36,6 +35,27 @@ pub struct SendItem {
 
 /// Progress callback signature: `(bytes_sent_total, current_file_index)`.
 pub type Progress = dyn Fn(u64, u32, &str) + Send + Sync;
+
+/// Pick a streaming chunk size for a file based on its size. Bigger
+/// files amortise framing/syscall overhead with bigger frames:
+///
+/// * `< 50 MiB`  → 512 KiB
+/// * `< 1 GiB`   → 4 MiB
+/// * `>= 1 GiB`  → 16 MiB
+///
+/// The result is always `<= MAX_CONTROL_FRAME`, so the receiver (which
+/// rejects oversized frames) accepts every chunk. The wire format is
+/// unchanged — chunks stay length-prefixed and resumable.
+pub(crate) fn chunk_size_for(file_size: u64) -> usize {
+    const MIB: u64 = 1024 * 1024;
+    if file_size < 50 * MIB {
+        512 * 1024
+    } else if file_size < 1024 * MIB {
+        4 * MIB as usize
+    } else {
+        16 * MIB as usize
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SenderConfig {
@@ -131,14 +151,33 @@ fn walk_dir<'a>(
     })
 }
 
-/// Connect to `addr`, run the protocol, send the manifest + bytes.
-/// `progress` is invoked from the same task; never call back into the
-/// sender from inside it.
+/// Build the manifest, then connect and stream. Convenience wrapper
+/// around [`send_prepared`] for callers that do not already have a
+/// manifest (e.g. tests). Production send paths should build the
+/// manifest once and call [`send_prepared`] directly to avoid hashing
+/// every file twice.
 pub async fn send_to(
     addr: std::net::SocketAddr,
     cfg: SenderConfig,
     identity: Arc<DeviceIdentity>,
     items: Vec<SendItem>,
+    progress: Arc<Progress>,
+    cancel: Arc<AtomicBool>,
+) -> Result<(PeerHandshake, Manifest)> {
+    let (manifest, local_paths) = build_manifest(&items).await?;
+    send_prepared(addr, cfg, identity, manifest, local_paths, progress, cancel).await
+}
+
+/// Connect to `addr`, run the protocol, send a pre-built `manifest`
+/// and its `local_paths` (parallel to `manifest.items`). `progress`
+/// is invoked from the same task; never call back into the sender
+/// from inside it.
+pub async fn send_prepared(
+    addr: std::net::SocketAddr,
+    cfg: SenderConfig,
+    identity: Arc<DeviceIdentity>,
+    manifest: Manifest,
+    local_paths: Vec<PathBuf>,
     progress: Arc<Progress>,
     cancel: Arc<AtomicBool>,
 ) -> Result<(PeerHandshake, Manifest)> {
@@ -161,8 +200,7 @@ pub async fn send_to(
     )
     .await?;
 
-    // 2. Build manifest, send Request::Send.
-    let (manifest, local_paths) = build_manifest(&items).await?;
+    // 2. Send Request::Send using the caller-supplied manifest.
     let request = Request::Send {
         transfer_id: manifest.transfer_id,
         manifest: manifest.clone(),
@@ -218,7 +256,11 @@ pub async fn send_to(
             f.seek(SeekFrom::Start(start_off)).await?;
         }
         let mut hasher = blake3::Hasher::new();
-        let mut buf = vec![0u8; DEFAULT_CHUNK_SIZE.min(MAX_CONTROL_FRAME / 2)];
+        // Adaptive chunk size: larger files use larger frames to cut
+        // per-chunk framing + syscall overhead on the hot path. Capped
+        // at the receiver's MAX_CONTROL_FRAME so the peer never rejects.
+        let chunk = chunk_size_for(item.size).min(MAX_CONTROL_FRAME);
+        let mut buf = vec![0u8; chunk];
         let mut remaining = item.size - start_off;
         while remaining > 0 {
             if cancel.load(Ordering::Relaxed) {
@@ -336,6 +378,10 @@ pub async fn pair_with(
                 verifying_key: peer.hello.verifying_key,
                 paired_at_ms: now,
                 last_seen_ms: now,
+                dest_override: None,
+                role: crate::pairing::DeviceRole::default(),
+                auto_accept: false,
+                auto_save: false,
             };
             cfg.trust.upsert(&trusted)?;
             Ok(peer)
