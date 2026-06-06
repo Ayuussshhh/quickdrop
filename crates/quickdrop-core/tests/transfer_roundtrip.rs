@@ -52,7 +52,7 @@ impl ReceiverHost for AcceptAllHost {
         _peer: &'a PeerHandshake,
         _manifest: &'a Manifest,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AcceptDecision> + Send + 'a>> {
-        Box::pin(async { AcceptDecision::Accept })
+        Box::pin(async { AcceptDecision::Accept { dest: None } })
     }
     fn on_pair_request<'a>(
         &'a self,
