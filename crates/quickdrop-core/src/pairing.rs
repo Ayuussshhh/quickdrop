@@ -30,6 +30,23 @@ use crate::{Error, Result};
 const TREE_PEERS: &str = "trust/peers/v1";
 const TREE_FP_INDEX: &str = "trust/fp_index/v1";
 
+/// User-assigned device role. Purely local metadata — it is **not**
+/// advertised over discovery, so the discovery wire format is
+/// untouched. Roles describe how the user categorises a paired device
+/// and are the hook for future role-specific behaviour (e.g. always
+/// route backups to a `Nas`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DeviceRole {
+    Mobile,
+    Desktop,
+    Laptop,
+    Nas,
+    Workstation,
+    #[default]
+    Other,
+}
+
 /// A peer the local device has agreed to trust. Persisted verbatim in
 /// the trust DB.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +62,22 @@ pub struct TrustedPeer {
     pub paired_at_ms: u64,
     /// Wall-clock millis of the last successful contact.
     pub last_seen_ms: u64,
+    /// Receiver-side preference: where transfers *from* this device
+    /// should be saved. `None` ⇒ use the global default destination.
+    #[serde(default)]
+    pub dest_override: Option<std::path::PathBuf>,
+    /// User-assigned role for this device (local metadata only).
+    #[serde(default)]
+    pub role: DeviceRole,
+    /// Instant Transfer Mode — auto-accept: skip the approval prompt and
+    /// start receiving immediately. Only honoured for trusted peers.
+    #[serde(default)]
+    pub auto_accept: bool,
+    /// Instant Transfer Mode — auto-save: when auto-accepting, save to
+    /// this peer's remembered [`dest_override`] without prompting for a
+    /// folder. With auto-save off, the configured default is used.
+    #[serde(default)]
+    pub auto_save: bool,
 }
 
 impl TrustedPeer {
@@ -144,6 +177,47 @@ impl TrustStore {
         }
         Ok(())
     }
+
+    /// Persist (or clear) the per-device receive destination. Returns
+    /// `false` if the peer is not trusted yet (nothing to remember on).
+    pub fn set_dest(&self, id: Uuid, dest: Option<std::path::PathBuf>) -> Result<bool> {
+        match self.get(id)? {
+            Some(mut p) => {
+                p.dest_override = dest;
+                self.upsert(&p)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Update the user-assigned role for a trusted device. Returns
+    /// `false` if the peer is unknown.
+    pub fn set_role(&self, id: Uuid, role: DeviceRole) -> Result<bool> {
+        match self.get(id)? {
+            Some(mut p) => {
+                p.role = role;
+                self.upsert(&p)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Update Instant Transfer Mode preferences (auto-accept / auto-save)
+    /// for a trusted device. Returns `false` if the peer is unknown so
+    /// these flags can never be set on an un-trusted peer.
+    pub fn set_instant_prefs(&self, id: Uuid, auto_accept: bool, auto_save: bool) -> Result<bool> {
+        match self.get(id)? {
+            Some(mut p) => {
+                p.auto_accept = auto_accept;
+                p.auto_save = auto_save;
+                self.upsert(&p)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
 }
 
 fn transaction_err(e: sled::transaction::TransactionError<()>) -> Error {
@@ -214,6 +288,10 @@ mod tests {
             verifying_key: [0u8; 32],
             paired_at_ms: 1,
             last_seen_ms: 1,
+            dest_override: None,
+            role: DeviceRole::default(),
+            auto_accept: false,
+            auto_save: false,
         }
     }
 
