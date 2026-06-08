@@ -77,6 +77,47 @@ fn ensure_dir(p: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Well-known user destination folders offered when the receiver picks
+/// where an incoming transfer should land. Each is best-effort; a
+/// missing OS folder falls back to the user's home directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DestOptions {
+    pub downloads: PathBuf,
+    pub desktop: PathBuf,
+    pub documents: PathBuf,
+}
+
+/// Resolve the user's Downloads folder, falling back to `~/Downloads`
+/// then the home directory. Used as the default receive location.
+pub fn downloads_dir() -> Option<PathBuf> {
+    use directories::UserDirs;
+    let dirs = UserDirs::new()?;
+    if let Some(d) = dirs.download_dir() {
+        return Some(d.to_path_buf());
+    }
+    Some(dirs.home_dir().join("Downloads"))
+}
+
+/// Resolve Downloads / Desktop / Documents for the receive-destination
+/// picker. Any folder the OS can't report falls back to the home dir.
+pub fn dest_options() -> DestOptions {
+    use directories::UserDirs;
+    let dirs = UserDirs::new();
+    let home = dirs
+        .as_ref()
+        .map(|d| d.home_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let pick = |sub: Option<&Path>, fallback: &str| {
+        sub.map(|p| p.to_path_buf())
+            .unwrap_or_else(|| home.join(fallback))
+    };
+    DestOptions {
+        downloads: pick(dirs.as_ref().and_then(|d| d.download_dir()), "Downloads"),
+        desktop: pick(dirs.as_ref().and_then(|d| d.desktop_dir()), "Desktop"),
+        documents: pick(dirs.as_ref().and_then(|d| d.document_dir()), "Documents"),
+    }
+}
+
 /// User-editable settings persisted to `<app_data>/settings.json`.
 /// Kept tiny on purpose. Anything large (peer trust, transfer history)
 /// lives in sled, not here.
