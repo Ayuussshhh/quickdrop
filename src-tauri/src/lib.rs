@@ -7,9 +7,11 @@ use std::sync::{Arc, RwLock};
 use quickdrop_core::config::{Paths, Settings};
 use quickdrop_core::db::Db;
 use quickdrop_core::discovery::{DeviceType, DiscoveryConfig, DiscoveryService, OsKind, Peer};
+use quickdrop_core::history::{HistoryStore, TransferRecord};
 use quickdrop_core::identity::{DeviceIdentity, Fingerprint};
 use quickdrop_core::logging::{self, LogGuard};
-use quickdrop_core::pairing::{TrustStore, TrustedPeer};
+use quickdrop_core::pairing::{DeviceRole, TrustStore, TrustedPeer};
+use quickdrop_core::spaces::{MemberRole, Space, SpaceStore, SpaceType};
 use quickdrop_core::transfer::manager::TransferManager;
 use quickdrop_core::transfer::protocol::{Manifest, TransferStatus};
 use quickdrop_core::transfer::receiver::{
@@ -39,6 +41,10 @@ pub struct AppState {
     pub identity: Arc<DeviceIdentity>,
     pub trust: TrustStore,
     pub manager: TransferManager,
+    /// Durable transfer history (survives restarts).
+    pub history: HistoryStore,
+    /// QuickDrop Spaces foundation store.
+    pub spaces: SpaceStore,
     /// Locked discovery handle so we can rebind on settings change.
     pub discovery: AsyncMutex<Option<DiscoveryService>>,
     pub receiver: AsyncMutex<Option<ReceiverHandle>>,
@@ -62,7 +68,9 @@ pub struct AppState {
 #[derive(Debug)]
 pub enum PromptReply {
     Pair(oneshot::Sender<PairDecision>),
-    Transfer(oneshot::Sender<AcceptDecision>),
+    /// Transfer prompt: carries the sending peer's id so an accepted
+    /// "remember this folder" choice can be persisted against it.
+    Transfer(Uuid, oneshot::Sender<AcceptDecision>),
 }
 
 #[derive(Debug, Serialize)]
@@ -108,6 +116,10 @@ struct TrustedPeerView {
     fingerprint: String,
     paired_at_ms: u64,
     last_seen_ms: u64,
+    role: DeviceRole,
+    auto_accept: bool,
+    auto_save: bool,
+    dest_override: Option<String>,
 }
 
 impl From<TrustedPeer> for TrustedPeerView {
@@ -118,6 +130,10 @@ impl From<TrustedPeer> for TrustedPeerView {
             fingerprint: p.fingerprint.to_string(),
             paired_at_ms: p.paired_at_ms,
             last_seen_ms: p.last_seen_ms,
+            role: p.role,
+            auto_accept: p.auto_accept,
+            auto_save: p.auto_save,
+            dest_override: p.dest_override.map(|d| d.to_string_lossy().into_owned()),
         }
     }
 }
@@ -156,6 +172,172 @@ fn cancel_transfer(state: tauri::State<'_, Arc<AppState>>, transfer_id: String) 
     }
 }
 
+/// Derive a friendly history display name from the first file's name and
+/// the total item count: the single file, or `"N files"` for a batch.
+fn history_file_name(first: Option<&str>, total: u32) -> String {
+    match (first, total) {
+        (Some(name), 1) => name.to_string(),
+        (Some(name), n) if n > 1 => format!("{name} + {} more", n - 1),
+        (_, n) => format!("{n} files"),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Instant Transfer Mode + Device Roles (per-device trust settings)
+// ---------------------------------------------------------------------
+
+#[tauri::command]
+fn set_device_role(
+    state: tauri::State<'_, Arc<AppState>>,
+    peer_id: String,
+    role: DeviceRole,
+) -> std::result::Result<bool, String> {
+    let id = Uuid::parse_str(&peer_id).map_err(|e| format!("invalid peer id: {e}"))?;
+    state.trust.set_role(id, role).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_device_prefs(
+    state: tauri::State<'_, Arc<AppState>>,
+    peer_id: String,
+    auto_accept: bool,
+    auto_save: bool,
+) -> std::result::Result<bool, String> {
+    let id = Uuid::parse_str(&peer_id).map_err(|e| format!("invalid peer id: {e}"))?;
+    state
+        .trust
+        .set_instant_prefs(id, auto_accept, auto_save)
+        .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------
+// Transfer history
+// ---------------------------------------------------------------------
+
+#[tauri::command]
+fn list_history(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> std::result::Result<Vec<TransferRecord>, String> {
+    state.history.list().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_history_entry(
+    state: tauri::State<'_, Arc<AppState>>,
+    entry_id: String,
+) -> std::result::Result<bool, String> {
+    let id = Uuid::parse_str(&entry_id).map_err(|e| format!("invalid id: {e}"))?;
+    state.history.delete(id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn clear_history(state: tauri::State<'_, Arc<AppState>>) -> std::result::Result<(), String> {
+    state.history.clear().map_err(|e| e.to_string())
+}
+
+/// Open a file with the OS default handler.
+#[tauri::command]
+fn open_path(app: AppHandle, path: String) -> std::result::Result<(), String> {
+    app.opener()
+        .open_path(path, None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+/// Reveal a file in its containing folder (Explorer/Finder).
+#[tauri::command]
+fn reveal_path(app: AppHandle, path: String) -> std::result::Result<(), String> {
+    app.opener()
+        .reveal_item_in_dir(PathBuf::from(path))
+        .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------
+// QuickDrop Spaces (foundation)
+// ---------------------------------------------------------------------
+
+#[tauri::command]
+fn list_spaces(state: tauri::State<'_, Arc<AppState>>) -> std::result::Result<Vec<Space>, String> {
+    state.spaces.list().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn create_space(
+    state: tauri::State<'_, Arc<AppState>>,
+    name: String,
+    space_type: SpaceType,
+) -> std::result::Result<Space, String> {
+    let owner = state.identity.id();
+    let owner_name = state.settings.read().unwrap().device_name.clone();
+    state
+        .spaces
+        .create(name, space_type, owner, owner_name)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_space(
+    state: tauri::State<'_, Arc<AppState>>,
+    space_id: String,
+) -> std::result::Result<bool, String> {
+    let id = Uuid::parse_str(&space_id).map_err(|e| format!("invalid id: {e}"))?;
+    state.spaces.delete(id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn add_space_member(
+    state: tauri::State<'_, Arc<AppState>>,
+    space_id: String,
+    peer_id: String,
+    name: String,
+    role: MemberRole,
+) -> std::result::Result<Space, String> {
+    let sid = Uuid::parse_str(&space_id).map_err(|e| format!("invalid space id: {e}"))?;
+    let pid = Uuid::parse_str(&peer_id).map_err(|e| format!("invalid peer id: {e}"))?;
+    state
+        .spaces
+        .add_member(sid, pid, name, role)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remove_space_member(
+    state: tauri::State<'_, Arc<AppState>>,
+    space_id: String,
+    peer_id: String,
+) -> std::result::Result<Space, String> {
+    let sid = Uuid::parse_str(&space_id).map_err(|e| format!("invalid space id: {e}"))?;
+    let pid = Uuid::parse_str(&peer_id).map_err(|e| format!("invalid peer id: {e}"))?;
+    state
+        .spaces
+        .remove_member(sid, pid)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn add_space_folder(
+    state: tauri::State<'_, Arc<AppState>>,
+    space_id: String,
+    name: String,
+    path: String,
+) -> std::result::Result<Space, String> {
+    let sid = Uuid::parse_str(&space_id).map_err(|e| format!("invalid space id: {e}"))?;
+    let owner = state.identity.id();
+    state
+        .spaces
+        .add_folder(sid, name, PathBuf::from(path), owner)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn space_activity(
+    state: tauri::State<'_, Arc<AppState>>,
+    space_id: String,
+) -> std::result::Result<Vec<quickdrop_core::spaces::Activity>, String> {
+    let id = Uuid::parse_str(&space_id).map_err(|e| format!("invalid id: {e}"))?;
+    state.spaces.activity(id).map_err(|e| e.to_string())
+}
+
+
 #[tauri::command]
 async fn send_files(
     app: AppHandle,
@@ -178,6 +360,11 @@ async fn send_files(
         .copied()
         .ok_or_else(|| "peer has no address".to_string())?;
     let device_name = state.settings.read().unwrap().device_name.clone();
+    // Captured for the transfer-history record written on completion.
+    let my_name = device_name.clone();
+    let hist_peer_name = peer.name.clone();
+    let hist_peer_id = peer.id;
+    let source_paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
     let cfg = SenderConfig {
         device_name,
         os: OsKind::current(),
@@ -196,13 +383,22 @@ async fn send_files(
         return Err("no files selected".into());
     }
 
-    // Pre-build manifest just to estimate totals for the UI row.
-    let (manifest, _local) = sender::build_manifest(&items)
+    // Build the manifest once: it drives both the UI totals and the
+    // actual wire protocol, so the transfer_id stays consistent and we
+    // hash every file only once.
+    let (manifest, local_paths) = sender::build_manifest(&items)
         .await
         .map_err(|e| format!("build manifest: {e}"))?;
     let total_items = manifest.items.len() as u32;
     let total_bytes = manifest.total_bytes;
     let transfer_id = manifest.transfer_id;
+    let hist_file_name = history_file_name(
+        manifest
+            .items
+            .first()
+            .map(|i| i.rel_path.rsplit('/').next().unwrap_or(&i.rel_path)),
+        total_items,
+    );
     let cancel = manager.register(
         transfer_id,
         Direction::Send,
@@ -218,10 +414,22 @@ async fn send_files(
 
     let app_for_task = app.clone();
     let manager_done = manager.clone();
+    let history = state.history.clone();
     tokio::spawn(async move {
-        let res = sender::send_to(addr, cfg, identity, items, progress, cancel.clone()).await;
+        let res = sender::send_prepared(
+            addr,
+            cfg,
+            identity,
+            manifest,
+            local_paths,
+            progress,
+            cancel.clone(),
+        )
+        .await;
+        let record_status;
         match res {
             Ok(_) => {
+                record_status = TransferState::Completed;
                 manager_done.finish(transfer_id, TransferState::Completed);
                 let _ = app_for_task.emit("transfers://updated", manager_done.snapshot());
             }
@@ -232,11 +440,29 @@ async fn send_files(
                 } else {
                     TransferState::Failed
                 };
+                record_status = st;
                 manager_done.finish(transfer_id, st);
                 let _ = app_for_task.emit("transfers://updated", manager_done.snapshot());
                 let _ = app_for_task.emit("transfers://error", e.to_string());
             }
         }
+        // Persist a durable history record for this send.
+        let rec = TransferRecord {
+            id: transfer_id,
+            file_name: hist_file_name,
+            direction: Direction::Send,
+            peer_id: hist_peer_id,
+            source_device: my_name,
+            target_device: hist_peer_name,
+            timestamp_ms: quickdrop_core::history::now_ms(),
+            size: total_bytes,
+            status: record_status,
+            paths: source_paths,
+        };
+        if let Err(e) = history.record(&rec) {
+            tracing::warn!(error = %e, "failed to record send history");
+        }
+        let _ = app_for_task.emit("history://updated", ());
     });
 
     let _ = app.emit("transfers://updated", manager.snapshot());
@@ -291,6 +517,8 @@ fn answer_prompt(
     prompt_id: String,
     accept: bool,
     reason: Option<String>,
+    dest: Option<String>,
+    remember: Option<bool>,
 ) -> std::result::Result<(), String> {
     let id = Uuid::parse_str(&prompt_id).map_err(|e| format!("invalid prompt id: {e}"))?;
     let entry = state
@@ -307,9 +535,17 @@ fn answer_prompt(
                 PairDecision::Reject(reason.unwrap_or_else(|| "user rejected".into()))
             });
         }
-        PromptReply::Transfer(tx) => {
+        PromptReply::Transfer(peer_id, tx) => {
+            let dest_path = dest.filter(|d| !d.is_empty()).map(PathBuf::from);
+            if accept && remember.unwrap_or(false) {
+                // Persist the destination for this device (only takes
+                // effect if the peer is already trusted).
+                if let Err(e) = state.trust.set_dest(peer_id, dest_path.clone()) {
+                    tracing::warn!(error = %e, "failed to remember destination");
+                }
+            }
             let _ = tx.send(if accept {
-                AcceptDecision::Accept
+                AcceptDecision::Accept { dest: dest_path }
             } else {
                 AcceptDecision::Reject(reason.unwrap_or_else(|| "user rejected".into()))
             });
@@ -330,6 +566,14 @@ struct PromptPayload {
     /// Manifest summary for transfer prompts.
     items: Option<u32>,
     total_bytes: Option<u64>,
+    /// First file name (or only file) for transfer prompts.
+    name: Option<String>,
+    /// Remembered destination for this device, if any.
+    remembered_dest: Option<String>,
+    /// Suggested receive folders for the destination picker.
+    downloads: Option<String>,
+    desktop: Option<String>,
+    documents: Option<String>,
     trusted: bool,
 }
 
@@ -348,17 +592,47 @@ impl ReceiverHost for TauriHost {
         let app = self.app.clone();
         let state = self.state.clone();
         Box::pin(async move {
+            let trusted = state
+                .trust
+                .is_trusted(&peer.hello.fingerprint)
+                .unwrap_or(false);
+            // Load the full trust record so we can honour per-device
+            // Instant Transfer Mode (auto-accept / auto-save) and any
+            // remembered destination folder.
+            let record = state
+                .trust
+                .get_by_fingerprint(&peer.hello.fingerprint)
+                .ok()
+                .flatten();
+            let remembered = record.as_ref().and_then(|p| p.dest_override.clone());
+            let dev_auto_accept = record.as_ref().map(|p| p.auto_accept).unwrap_or(false);
+            let dev_auto_save = record.as_ref().map(|p| p.auto_save).unwrap_or(false);
+            let global_auto_accept = state.settings.read().unwrap().auto_accept_trusted;
+
+            // Instant Transfer Mode: a trusted peer with per-device
+            // auto-accept (or the global auto-accept fallback) skips the
+            // approval prompt entirely. When auto-save is on we route to
+            // the peer's remembered folder; otherwise the receiver falls
+            // back to the configured default (dest = None). Untrusted
+            // peers can never reach this path — the security model is
+            // unchanged.
+            if trusted && (dev_auto_accept || global_auto_accept) {
+                let dest = if dev_auto_save { remembered } else { None };
+                return AcceptDecision::Accept { dest };
+            }
+
             let prompt_id = Uuid::new_v4();
             let (tx, rx) = oneshot::channel();
             state
                 .pending_prompts
                 .lock()
                 .unwrap()
-                .insert(prompt_id, PromptReply::Transfer(tx));
-            let trusted = state
-                .trust
-                .is_trusted(&peer.hello.fingerprint)
-                .unwrap_or(false);
+                .insert(prompt_id, PromptReply::Transfer(peer.hello.id, tx));
+            let dests = quickdrop_core::config::dest_options();
+            let first_name = manifest
+                .items
+                .first()
+                .map(|i| i.rel_path.rsplit('/').next().unwrap_or(&i.rel_path).to_string());
             let _ = app.emit(
                 "prompt://incoming",
                 PromptPayload {
@@ -370,6 +644,11 @@ impl ReceiverHost for TauriHost {
                     sas: None,
                     items: Some(manifest.items.len() as u32),
                     total_bytes: Some(manifest.total_bytes),
+                    name: first_name,
+                    remembered_dest: remembered.map(|p| p.to_string_lossy().into_owned()),
+                    downloads: Some(dests.downloads.to_string_lossy().into_owned()),
+                    desktop: Some(dests.desktop.to_string_lossy().into_owned()),
+                    documents: Some(dests.documents.to_string_lossy().into_owned()),
                     trusted,
                 },
             );
@@ -415,6 +694,11 @@ impl ReceiverHost for TauriHost {
                     sas: Some(sas),
                     items: None,
                     total_bytes: None,
+                    name: None,
+                    remembered_dest: None,
+                    downloads: None,
+                    desktop: None,
+                    documents: None,
                     trusted: false,
                 },
             );
@@ -473,6 +757,13 @@ impl ReceiverHost for TauriHost {
             TransferStatus::Cancelled => TransferState::Cancelled,
             TransferStatus::Failed => TransferState::Failed,
         };
+        // Snapshot the row (for size) before finishing.
+        let row = self
+            .state
+            .manager
+            .snapshot()
+            .into_iter()
+            .find(|t| t.transfer_id == transfer_id);
         self.state.manager.finish(transfer_id, st);
         let _ = self
             .app
@@ -484,6 +775,34 @@ impl ReceiverHost for TauriHost {
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect::<Vec<_>>(),
         );
+
+        // Persist a durable history record for this receive.
+        let size = row.as_ref().map(|r| r.bytes_done).unwrap_or(0);
+        let file_name = history_file_name(
+            files_written
+                .first()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy())
+                .as_deref(),
+            files_written.len() as u32,
+        );
+        let my_name = self.state.settings.read().unwrap().device_name.clone();
+        let rec = TransferRecord {
+            id: transfer_id,
+            file_name,
+            direction: Direction::Receive,
+            peer_id: _peer.hello.id,
+            source_device: _peer.hello.name.clone(),
+            target_device: my_name,
+            timestamp_ms: quickdrop_core::history::now_ms(),
+            size,
+            status: st,
+            paths: files_written,
+        };
+        if let Err(e) = self.state.history.record(&rec) {
+            tracing::warn!(error = %e, "failed to record receive history");
+        }
+        let _ = self.app.emit("history://updated", ());
     }
 }
 
@@ -507,6 +826,8 @@ pub fn run() {
     );
 
     let trust = TrustStore::open(&db).expect("failed to open trust store");
+    let history = HistoryStore::open(&db).expect("failed to open history store");
+    let spaces = SpaceStore::open(&db).expect("failed to open spaces store");
     let (manager, _mgr_rx) = TransferManager::new();
 
     let state = Arc::new(AppState {
@@ -515,6 +836,8 @@ pub fn run() {
         identity,
         trust,
         manager,
+        history,
+        spaces,
         discovery: AsyncMutex::new(None),
         receiver: AsyncMutex::new(None),
         listen_port: std::sync::atomic::AtomicU16::new(0),
@@ -556,6 +879,20 @@ pub fn run() {
             send_files,
             pair_with,
             answer_prompt,
+            set_device_role,
+            set_device_prefs,
+            list_history,
+            delete_history_entry,
+            clear_history,
+            open_path,
+            reveal_path,
+            list_spaces,
+            create_space,
+            delete_space,
+            add_space_member,
+            remove_space_member,
+            add_space_folder,
+            space_activity,
             install_context_menu,
             uninstall_context_menu,
             share_file,
