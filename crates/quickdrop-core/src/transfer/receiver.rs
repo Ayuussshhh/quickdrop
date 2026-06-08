@@ -36,7 +36,11 @@ use crate::{Error, Result};
 /// `Accept`/`Reject`.
 #[derive(Debug, Clone)]
 pub enum AcceptDecision {
-    Accept,
+    /// Accept the transfer. `dest` overrides the receive folder for
+    /// this transfer only; `None` falls back to the configured
+    /// destination. The host is responsible for choosing a trusted,
+    /// local path — remote peers never influence it.
+    Accept { dest: Option<PathBuf> },
     Reject(String),
 }
 
@@ -247,6 +251,10 @@ where
                 verifying_key: peer.hello.verifying_key,
                 paired_at_ms: now,
                 last_seen_ms: now,
+                dest_override: None,
+                role: crate::pairing::DeviceRole::default(),
+                auto_accept: false,
+                auto_save: false,
             };
             cfg.trust.upsert(&trusted)?;
             transport::write_msg(tls, &Response::PairingAccepted).await?;
@@ -279,40 +287,36 @@ where
         return Err(Error::Protocol("manifest too large".into()));
     }
 
-    // Snapshot settings.
-    let (dest_root, sort_by_category, auto_accept_trusted) = {
-        let s = cfg.settings.read().unwrap();
-        (
-            s.destination.clone().unwrap_or_else(|| cfg.default_dest.clone()),
-            s.sort_by_category,
-            s.auto_accept_trusted,
-        )
+    // Snapshot the category-sort preference up front; the destination
+    // root is decided only after the host (user) chooses one.
+    let sort_by_category = cfg.settings.read().unwrap().sort_by_category;
+
+    // Authorisation FIRST. The host decides whether to accept and, if
+    // so, where the files should land. Doing this before any path math
+    // means a rejected/timed-out request never touches the filesystem.
+    let decision = host.on_transfer_request(peer, &manifest).await;
+    let chosen_dest = match decision {
+        AcceptDecision::Accept { dest } => dest,
+        AcceptDecision::Reject(r) => {
+            transport::write_msg(tls, &Response::Reject { reason: r.clone() }).await?;
+            return Err(Error::PeerRejected(r));
+        }
     };
 
-    // Pre-validate every rel_path BEFORE prompting the user, so a
-    // malicious manifest fails closed without bothering them.
+    // Resolve the destination root: explicit host choice wins, then the
+    // configured destination, then the built-in default.
+    let dest_root = chosen_dest
+        .or_else(|| cfg.settings.read().unwrap().destination.clone())
+        .unwrap_or_else(|| cfg.default_dest.clone());
+
+    // Validate every rel_path against the chosen root. A malicious
+    // manifest can still only ever resolve *inside* dest_root.
     let mut sanitized: Vec<(PathBuf, PathBuf, std::ffi::OsString)> =
         Vec::with_capacity(manifest.items.len());
     for item in &manifest.items {
         let safe = files::sanitize_rel_path(&item.rel_path)?;
         let (dir, name) = files::resolve_dest(&dest_root, &safe, sort_by_category);
         sanitized.push((safe, dir, name));
-    }
-
-    // Authorisation.
-    let trusted = cfg.trust.is_trusted(&peer.hello.fingerprint).unwrap_or(false);
-    let decision = if trusted && auto_accept_trusted {
-        AcceptDecision::Accept
-    } else {
-        host.on_transfer_request(peer, &manifest).await
-    };
-    let reason = match decision {
-        AcceptDecision::Accept => None,
-        AcceptDecision::Reject(r) => Some(r),
-    };
-    if let Some(r) = reason {
-        transport::write_msg(tls, &Response::Reject { reason: r.clone() }).await?;
-        return Err(Error::PeerRejected(r));
     }
 
     // Touch trust last_seen.
